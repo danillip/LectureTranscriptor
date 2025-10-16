@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE / OS
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Кэши и модели
+_ct2_cache/
+_hf_cache/
+_tmp/
+_ffmpeg/
+_ffmpeg.zip
+
+# Streamlit конфиги
+.streamlit/
+
+# Артефакты
+out/
+!out/.gitkeep
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.bak
