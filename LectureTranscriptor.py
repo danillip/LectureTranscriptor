@@ -571,6 +571,152 @@ def save_markdown(text: str, out_dir: Path, out_name: str) -> Path:
     out_path.write_text(text, encoding="utf-8")
     return out_path
 
+def _build_unique_output_path(out_dir: Path, out_name: str, ext: str) -> Path:
+    """Строит уникальный путь out_dir/out_name.ext (с суффиксом _2, _3, ... при коллизии)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = Path((out_name or "").strip()).stem.strip() or "result"
+    out_path = out_dir / f"{base}{ext}"
+    idx = 1
+    while out_path.exists():
+        idx += 1
+        out_path = out_dir / f"{base}_{idx}{ext}"
+    return out_path
+
+def merge_video_and_audio_fast(
+    video_path: Path,
+    audio_path: Path,
+    out_dir: Path,
+    out_name: str,
+    device_choice: str,
+    progress_placeholder,
+    eta_placeholder,
+    log_placeholder,
+) -> Path:
+    """
+    Быстро объединяет видео и аудио в MP4:
+    - видео копируется без перекодирования (сохраняется исходное разрешение),
+    - аудио кодируется в AAC для совместимости.
+    Показывает прогресс, ETA и лог выполнения.
+    """
+    _, ffmpeg_path, _ = ensure_ffmpeg(autofix=True)
+    if not ffmpeg_path:
+        raise RuntimeError("ffmpeg не найден.")
+
+    out_path = _build_unique_output_path(out_dir, out_name, ".mp4")
+
+    video_duration = get_media_duration_sec(video_path) or 0.0
+    audio_duration = get_media_duration_sec(audio_path) or 0.0
+    durations = [d for d in (video_duration, audio_duration) if d > 0]
+    total_duration = min(durations) if durations else 0.0
+
+    logs: List[str] = []
+    def _push_log(msg: str):
+        ts = time.strftime("%H:%M:%S")
+        logs.append(f"[{ts}] {msg}")
+        log_placeholder.code("\n".join(logs[-18:]), language="text")
+
+    _push_log(f"Режим устройства: {device_choice}")
+    _push_log(f"Видео: {video_path.name}")
+    _push_log(f"Аудио: {audio_path.name}")
+    _push_log(f"Выход: {out_path}")
+    if total_duration > 0:
+        _push_log(f"Оценка длительности для ETA: {format_hhmmss(total_duration)}")
+    else:
+        _push_log("ETA ограничена: длительность не удалось определить точно.")
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-nostats",
+        "-progress", "pipe:2",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+
+    # Привязка к выбору устройства для операции объединения.
+    # Склейка максимально быстрая (video stream copy), поэтому меняем только runtime-параметры ffmpeg.
+    if device_choice == "GPU (CUDA)":
+        cmd.insert(1, "auto")
+        cmd.insert(1, "-hwaccel")
+        _push_log("FFmpeg: включён hwaccel=auto (режим GPU/CUDA).")
+    elif device_choice == "CPU":
+        cmd.insert(1, "0")
+        cmd.insert(1, "-threads")
+        _push_log("FFmpeg: режим CPU, threads=0.")
+    else:
+        _push_log("FFmpeg: режим Авто.")
+
+    progress_placeholder.progress(0.0, text="Объединение: запуск…")
+    eta_placeholder.info("⏳ Подготовка оценки времени…")
+
+    started = time.time()
+    last_processed = 0.0
+    stderr_lines: List[str] = []
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        bufsize=1,
+    )
+
+    if proc.stderr:
+        for raw in proc.stderr:
+            line = raw.strip()
+            if not line:
+                continue
+            stderr_lines.append(line)
+
+            if "=" in line:
+                key, val = line.split("=", 1)
+                if key in ("out_time_ms", "out_time_us"):
+                    try:
+                        # В ffmpeg `out_time_ms` по факту в микросекундах (legacy naming).
+                        micros = float(val)
+                        last_processed = max(last_processed, micros / 1_000_000.0)
+                    except Exception:
+                        pass
+                elif key == "progress":
+                    if val == "end":
+                        progress_placeholder.progress(1.0, text="Объединение: 100%")
+                        eta_placeholder.success("✅ Объединение завершено")
+                        _push_log("FFmpeg сообщил: progress=end")
+                elif key == "speed":
+                    _push_log(f"Скорость FFmpeg: {val}")
+
+            if total_duration > 0:
+                ratio = min(1.0, max(0.0, last_processed / total_duration))
+                progress_placeholder.progress(
+                    ratio,
+                    text=f"Объединение: {format_hhmmss(last_processed)} / {format_hhmmss(total_duration)}",
+                )
+                if ratio > 0:
+                    elapsed = max(1e-6, time.time() - started)
+                    remain = elapsed * (1.0 - ratio) / ratio
+                    eta_placeholder.info(f"⏳ ETA ≈ {remain/60:0.1f} мин")
+            else:
+                progress_placeholder.progress(0.0, text=f"Объединение: обработано {format_hhmmss(last_processed)}")
+
+    proc.wait()
+    if proc.returncode != 0:
+        tail = "\n".join(stderr_lines[-30:])
+        raise RuntimeError(f"Ошибка FFmpeg при объединении:\n{tail}")
+    progress_placeholder.progress(1.0, text="Объединение: готово")
+    eta_placeholder.success("✅ Объединение завершено")
+    _push_log("Файл успешно собран.")
+    return out_path
+
 # =============================== UI ===============================
 
 st.set_page_config(
@@ -614,74 +760,138 @@ use_vad = st.sidebar.checkbox("VAD фильтр (удалять тишину)", 
 
 st.sidebar.markdown("---")
 out_dir = st.sidebar.text_input("Папка для результата", value=str(BASE_DIR / "out"))
-out_name = st.sidebar.text_input("Имя итогового файла (.md)", value="transcript")
+out_name = st.sidebar.text_input("Имя итогового файла (без расширения)", value="transcript")
 
-uploaded = st.file_uploader("Загрузите аудио/видео", type=["mp3","wav","m4a","mp4","mkv","mov","webm","ogg"], accept_multiple_files=False)
+tabs = st.tabs(["Транскрибация", "Склейка видео + звук"])
 
-st.caption("Поддерживаются популярные форматы. Для видео используется встроенный аудиодемультиплексор (FFmpeg).")
+with tabs[0]:
+    uploaded = st.file_uploader(
+        "Загрузите аудио/видео",
+        type=["mp3", "wav", "m4a", "mp4", "mkv", "mov", "webm", "ogg"],
+        accept_multiple_files=False,
+        key="transcribe_uploader",
+    )
+    st.caption("Поддерживаются популярные форматы. Для видео используется встроенный аудиодемультиплексор (FFmpeg).")
 
-start_btn = st.button("🚀 Транскрибировать")
+    start_btn = st.button("🚀 Транскрибировать", key="start_transcribe_btn")
 
-if start_btn:
-    if not uploaded:
-        st.error("Сначала загрузите файл.")
-        st.stop()
+    if start_btn:
+        if not uploaded:
+            st.error("Сначала загрузите файл.")
+            st.stop()
 
-    # Сохраним загруженный файл во временную папку внутри проекта
-    tmp_dir = BASE_DIR / "_tmp"
-    tmp_dir.mkdir(exist_ok=True)
-    media_path = tmp_dir / uploaded.name
-    with media_path.open("wb") as f:
-        f.write(uploaded.read())
+        # Сохраним загруженный файл во временную папку внутри проекта
+        tmp_dir = BASE_DIR / "_tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        media_path = tmp_dir / uploaded.name
+        with media_path.open("wb") as f:
+            f.write(uploaded.read())
 
-    # Загружаем модель
-    with st.status("Инициализация модели…", expanded=False) as status:
+        # Загружаем модель
+        with st.status("Инициализация модели…", expanded=False) as status:
+            try:
+                model = load_model(model_name, device_choice)
+                status.update(label="Модель готова", state="complete")
+            except Exception as e:
+                st.exception(e)
+                st.stop()
+
+        # Запоминаем старт времени для ETA
+        st.session_state["_start_ts"] = time.time()
+
+        # Плейсхолдеры прогресса и ETA
+        progress_placeholder = st.empty()
+        eta_placeholder = st.empty()
+
         try:
-            model = load_model(model_name, device_choice)
-            status.update(label="Модель готова", state="complete")
+            md_text = transcribe_file(
+                model=model,
+                media_path=media_path,
+                language=language if language != "auto" else None,
+                task=task,
+                beam_size=beam_size,
+                vad=use_vad,
+                progress_placeholder=progress_placeholder,
+                eta_placeholder=eta_placeholder,
+            )
         except Exception as e:
             st.exception(e)
             st.stop()
+        finally:
+            # очистим временный файл
+            try:
+                media_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-    # Запоминаем старт времени для ETA
-    st.session_state["_start_ts"] = time.time()
+        # Сохранение
+        out_path = save_markdown(md_text, Path(out_dir), out_name)
 
-    # Плейсхолдеры прогресса и ETA
-    progress_placeholder = st.empty()
-    eta_placeholder = st.empty()
+        st.success(f"Готово! Файл сохранён: `{out_path}`")
+        st.download_button("⬇️ Скачать .md", data=md_text.encode("utf-8"),
+                           file_name=Path(out_name).with_suffix(".md").name, mime="text/markdown")
 
-    try:
-        md_text = transcribe_file(
-            model=model,
-            media_path=media_path,
-            language=language if language != "auto" else None,
-            task=task,
-            beam_size=beam_size,
-            vad=use_vad,
-            progress_placeholder=progress_placeholder,
-            eta_placeholder=eta_placeholder,
-        )
-    except Exception as e:
-        st.exception(e)
-        st.stop()
-    finally:
-        # очистим временный файл
+        # Предпросмотр
+        st.markdown("---")
+        st.subheader("Предпросмотр")
+        st.markdown(md_text)
+
+with tabs[1]:
+    st.caption("Быстрое объединение: видео берётся как есть, аудио подставляется из второго файла (в т.ч. если это видео). Вывод берётся из полей слева: папка + имя.")
+    merge_video = st.file_uploader(
+        "Выберите файл с видео",
+        type=["mp4", "mkv", "mov", "webm", "avi", "m4v"],
+        accept_multiple_files=False,
+        key="merge_video_uploader",
+    )
+    merge_audio = st.file_uploader(
+        "Выберите файл со звуком (аудио или видео)",
+        type=["mp3", "wav", "m4a", "ogg", "flac", "aac", "mp4", "mkv", "mov", "webm", "avi", "m4v"],
+        accept_multiple_files=False,
+        key="merge_audio_uploader",
+    )
+    merge_btn = st.button("⚡ Объединить", key="merge_btn")
+
+    if merge_btn:
+        if not merge_video or not merge_audio:
+            st.error("Выберите оба файла: видео и аудио (или видео-источник звука).")
+            st.stop()
+
+        tmp_dir = BASE_DIR / "_tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        video_tmp = tmp_dir / f"merge_video_{merge_video.name}"
+        audio_tmp = tmp_dir / f"merge_audio_{merge_audio.name}"
+        with video_tmp.open("wb") as f:
+            f.write(merge_video.read())
+        with audio_tmp.open("wb") as f:
+            f.write(merge_audio.read())
+
+        progress_placeholder_merge = st.empty()
+        eta_placeholder_merge = st.empty()
+        log_placeholder_merge = st.empty()
+
         try:
-            media_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    # Сохранение
-    out_path = save_markdown(md_text, Path(out_dir), out_name)
-
-    st.success(f"Готово! Файл сохранён: `{out_path}`")
-    st.download_button("⬇️ Скачать .md", data=md_text.encode("utf-8"),
-                       file_name=Path(out_name).with_suffix(".md").name, mime="text/markdown")
-
-    # Предпросмотр
-    st.markdown("---")
-    st.subheader("Предпросмотр")
-    st.markdown(md_text)
+            with st.status("Объединяю видео и звук…", expanded=False) as status:
+                merged_path = merge_video_and_audio_fast(
+                    video_path=video_tmp,
+                    audio_path=audio_tmp,
+                    out_dir=Path(out_dir),
+                    out_name=out_name,
+                    device_choice=device_choice,
+                    progress_placeholder=progress_placeholder_merge,
+                    eta_placeholder=eta_placeholder_merge,
+                    log_placeholder=log_placeholder_merge,
+                )
+                status.update(label="Объединение завершено", state="complete")
+            st.success(f"Готово! Файл сохранён: `{merged_path}`")
+        except Exception as e:
+            st.exception(e)
+        finally:
+            try:
+                video_tmp.unlink(missing_ok=True)
+                audio_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 # =============================== Подсказки/FAQ ===============================
 
