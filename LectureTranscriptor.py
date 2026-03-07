@@ -5,6 +5,7 @@ import math
 import time
 import subprocess
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
@@ -49,70 +50,93 @@ def _register_dll_dir(p: Path) -> bool:
         os.environ["PATH"] = str(p) + os.pathsep + os.environ.get("PATH", "")
     return True
 
-def find_and_register_cudnn() -> List[Path]:
-    """
-    Ищет файлы cudnn*64_9.dll в типовых местах и регистрирует их каталоги.
-    Возвращает список добавленных путей. Ничего не делает на non-Windows.
-    """
+def _discover_cuda_roots() -> List[Path]:
+    """Возвращает типовые корни CUDA/cuDNN для поиска bin/include/lib."""
+    roots: List[Path] = []
+    if os.name != "nt":
+        return roots
+
+    for k, v in os.environ.items():
+        if k.startswith("CUDA_PATH") and v:
+            roots.append(Path(v))
+
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    roots.append(Path(pf) / "NVIDIA GPU Computing Toolkit" / "CUDA")
+    roots.append(Path(pf) / "NVIDIA" / "CUDNN")
+    roots.append(Path(pf) / "NVIDIA" / "cuDNN")
+    roots.append(Path(pf) / "NVIDIA Corporation")
+    return roots
+
+def _discover_cuda_bin_dirs() -> List[Path]:
+    """Ищет bin-каталоги CUDA в типовых местах."""
+    if os.name != "nt":
+        return []
+    bin_dirs: List[Path] = []
+    for root in _discover_cuda_roots():
+        if not root.exists():
+            continue
+        for sub in root.glob("v*"):
+            b = sub / "bin"
+            if b.exists():
+                bin_dirs.append(b.resolve())
+        b = root / "bin"
+        if b.exists():
+            bin_dirs.append(b.resolve())
+    return sorted(set(bin_dirs))
+
+def _discover_cudnn_bin_dirs() -> List[Path]:
+    """Ищет каталоги, где реально есть cudnn*64_9.dll."""
     if os.name != "nt":
         return []
 
-    added: List[Path] = []
     dll_candidates = {
         "cudnn_ops64_9.dll",
         "cudnn_cnn_infer64_9.dll",
         "cudnn_cnn_train64_9.dll",
         "cudnn64_9.dll",
     }
-
-    # 1) Корни для поиска
-    roots: List[Path] = []
-
-    # Переменные окружения CUDA (CUDA_PATH, CUDA_PATH_V*)
-    for k, v in os.environ.items():
-        if k.startswith("CUDA_PATH") and v:
-            roots.append(Path(v))
-
-    # Program Files стандартный путь CUDA Toolkit
-    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
-    roots.append(Path(pf) / "NVIDIA GPU Computing Toolkit" / "CUDA")
-
-    # Иногда ставят отдельно cuDNN
-    roots.append(Path(pf) / "NVIDIA" / "CUDNN")
-    roots.append(Path(pf) / "NVIDIA" / "cuDNN")
-    roots.append(Path(pf) / "NVIDIA Corporation")
-
-    # 2) Кандидаты bin-папок
-    bin_dirs: List[Path] = []
-    for root in roots:
-        if not root.exists():
-            continue
-        # .\v12.6\bin, v12.5\bin, ...
-        for sub in root.glob("v*"):
-            b = sub / "bin"
-            if b.exists():
-                bin_dirs.append(b)
-        # просто .\bin
-        b = root / "bin"
-        if b.exists():
-            bin_dirs.append(b)
-
-    # 3) Проверяем наличие нужных DLL
     found: List[Path] = []
-    for b in bin_dirs:
+    for b in _discover_cuda_bin_dirs():
         try:
             names = {p.name.lower() for p in b.glob("*.dll")}
             if any(dll in names for dll in (n.lower() for n in dll_candidates)):
                 found.append(b.resolve())
         except Exception:
             pass
+    return sorted(set(found))
 
-    # 4) Регистрируем
-    for d in sorted(set(found)):
+def find_and_register_cudnn() -> List[Path]:
+    """Регистрирует найденные каталоги cuDNN DLL и возвращает список добавленных путей."""
+    added: List[Path] = []
+    for d in _discover_cudnn_bin_dirs():
         if _register_dll_dir(d):
             added.append(d)
-
     return added
+
+def diagnose_cuda_stack() -> Dict[str, object]:
+    """Быстрая диагностика драйвера/CUDA/cuDNN."""
+    info: Dict[str, object] = {
+        "os_windows": os.name == "nt",
+        "nvidia_smi_ok": False,
+        "nvidia_smi_preview": "",
+        "cuda_path_vars": sorted([k for k in os.environ.keys() if k.startswith("CUDA_PATH")]),
+        "cuda_bin_dirs": _discover_cuda_bin_dirs() if os.name == "nt" else [],
+        "cudnn_bin_dirs": _discover_cudnn_bin_dirs() if os.name == "nt" else [],
+    }
+    if os.name != "nt":
+        info["ready_for_cuda"] = False
+        return info
+
+    try:
+        proc = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0 and proc.stdout.strip():
+            info["nvidia_smi_ok"] = True
+            info["nvidia_smi_preview"] = "\n".join(proc.stdout.strip().splitlines()[:2])
+    except Exception:
+        pass
+
+    info["ready_for_cuda"] = bool(info["nvidia_smi_ok"] and info["cudnn_bin_dirs"])
+    return info
 
 # Вызов до импорта faster_whisper/ctranslate2
 try:
@@ -159,22 +183,58 @@ def _extract_zip_to(base: Path, zip_path: Path) -> bool:
     import zipfile
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
+            if not _zip_has_required_bins(zf.namelist()):
+                return False
             zf.extractall(base)
         return True
     except Exception:
         return False
 
-def _download_official_zip(dst_zip: Path) -> bool:
+def _zip_has_required_bins(names: List[str]) -> bool:
+    normalized = {name.lower().replace("\\", "/") for name in names}
+    has_ffmpeg = any(name.endswith("/ffmpeg.exe") or name == "ffmpeg.exe" for name in normalized)
+    has_ffprobe = any(name.endswith("/ffprobe.exe") or name == "ffprobe.exe" for name in normalized)
+    return has_ffmpeg and has_ffprobe
+
+def _download_official_zip(dst_zip: Path, show_ui: bool = False) -> bool:
     """Скачивает официальный essentials zip. Возвращает True/False."""
+    progress = st.progress(0.0, text="⬇️ Скачиваю FFmpeg… 0%") if show_ui else None
+    status = st.empty() if show_ui else None
     try:
         import urllib.request
+        import shutil
         url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-        urllib.request.urlretrieve(url, dst_zip)
+        tmp_zip = dst_zip.with_suffix(".zip.part")
+        req = urllib.request.Request(url, headers={"User-Agent": "LectureTranscriptor/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as response, tmp_zip.open("wb") as out:
+            total = int(response.headers.get("Content-Length", "0") or 0)
+            downloaded = 0
+            chunk_size = 1024 * 1024
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                downloaded += len(chunk)
+                if progress and total > 0:
+                    ratio = min(1.0, downloaded / total)
+                    progress.progress(ratio, text=f"⬇️ Скачиваю FFmpeg… {ratio*100:0.1f}%")
+                elif status:
+                    status.info(f"⬇️ Скачано {downloaded / (1024 * 1024):0.1f} МБ…")
+
+        if dst_zip.exists():
+            dst_zip.unlink(missing_ok=True)
+        shutil.move(str(tmp_zip), str(dst_zip))
         return True
     except Exception:
         return False
+    finally:
+        if progress:
+            progress.empty()
+        if status:
+            status.empty()
 
-def ensure_ffmpeg(autofix: bool = True) -> Tuple[Optional[str], Optional[str], str]:
+def ensure_ffmpeg(autofix: bool = True, show_status: bool = False) -> Tuple[Optional[str], Optional[str], str]:
     """
     Гарантирует наличие ffprobe/ffmpeg.
     Логика:
@@ -204,48 +264,64 @@ def ensure_ffmpeg(autofix: bool = True) -> Tuple[Optional[str], Optional[str], s
 
     # --- B/C) попытки автодоустановки/установки ---
     if autofix:
-        # 1) Пробуем локальный архив (поддерживаем два имени)
-        zip_candidates = [BASE_DIR / "_ffmpeg.zip", BASE_DIR / "ffmpeg.zip"]
-        zip_path = next((z for z in zip_candidates if z.exists()), None)
+        status_ctx = st.status("Проверка FFmpeg…", expanded=True) if show_status else nullcontext()
+        with status_ctx as status:
+            def _update(msg: str):
+                if show_status and status is not None:
+                    status.update(label=msg)
 
-        if zip_path:
-            try:
-                size_mb = zip_path.stat().st_size / (1024 * 1024)
-            except Exception:
-                size_mb = 0.0
-            # essentials обычно 70–100+ МБ; но допускаем кастомные сборки
-            if size_mb >= 10:
-                if partial_present:
-                    st.info(f"🔧 Обнаружена неполная установка FFmpeg. Доустанавливаю из {zip_path.name}…")
+            # 1) Пробуем локальный архив (поддерживаем два имени)
+            _update("Проверяю локальный архив FFmpeg…")
+            zip_candidates = [BASE_DIR / "_ffmpeg.zip", BASE_DIR / "ffmpeg.zip"]
+            zip_path = next((z for z in zip_candidates if z.exists()), None)
+
+            if zip_path:
+                try:
+                    size_mb = zip_path.stat().st_size / (1024 * 1024)
+                except Exception:
+                    size_mb = 0.0
+                # essentials обычно 70–100+ МБ; но допускаем кастомные сборки
+                if size_mb >= 10:
+                    _update(f"Распаковываю FFmpeg из {zip_path.name}…")
+                    if _extract_zip_to(base, zip_path):
+                        fp2, fm2 = _find_bins_recursively(base)
+                        if fp2 and fm2:
+                            _register_dir_for_dlls(str(Path(fp2).parent))
+                            _FFPROBE_CACHED, _FFMPEG_CACHED = fp2, fm2
+                            tag = "completed from zip" if partial_present else "zip extracted"
+                            _update("FFmpeg готов.")
+                            return _FFPROBE_CACHED, _FFMPEG_CACHED, tag
                 else:
-                    st.info(f"📦 Устанавливаю FFmpeg из {zip_path.name}…")
-                if _extract_zip_to(base, zip_path):
-                    fp2, fm2 = _find_bins_recursively(base)
-                    if fp2 and fm2:
-                        _register_dir_for_dlls(str(Path(fp2).parent))
-                        _FFPROBE_CACHED, _FFMPEG_CACHED = fp2, fm2
-                        tag = "completed from zip" if partial_present else "zip extracted"
-                        return _FFPROBE_CACHED, _FFMPEG_CACHED, tag
+                    _update(f"Архив {zip_path.name} слишком маленький, пропускаю.")
 
-        # 2) Скачиваем официальный архив и распаковываем
-        dl_path = BASE_DIR / "_ffmpeg.zip"
-        if not dl_path.exists():
-            if partial_present:
-                st.info("🔧 Доустанавливаю FFmpeg — скачиваю официальный архив (~80 МБ)…")
-            else:
-                st.info("⬇️ Скачиваю FFmpeg (~80 МБ)…")
-            if not _download_official_zip(dl_path):
-                _FFPROBE_CACHED, _FFMPEG_CACHED = fp, fm
-                return _FFPROBE_CACHED, _FFMPEG_CACHED, "partial (download failed)" if partial_present else "not found"
+            # 2) Скачиваем официальный архив и распаковываем
+            dl_path = BASE_DIR / "_ffmpeg.zip"
+            need_download = not dl_path.exists()
+            if not need_download:
+                _update("Проверяю существующий _ffmpeg.zip…")
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(dl_path, "r") as zf:
+                        need_download = not _zip_has_required_bins(zf.namelist())
+                except Exception:
+                    need_download = True
 
-        st.info("📦 Распаковываю FFmpeg…")
-        if _extract_zip_to(base, dl_path):
-            fp3, fm3 = _find_bins_recursively(base)
-            if fp3 and fm3:
-                _register_dir_for_dlls(str(Path(fp3).parent))
-                _FFPROBE_CACHED, _FFMPEG_CACHED = fp3, fm3
-                tag = "completed by download" if partial_present else "downloaded"
-                return _FFPROBE_CACHED, _FFMPEG_CACHED, tag
+            if need_download:
+                _update("Скачиваю официальный архив FFmpeg (~80 МБ)…")
+                if not _download_official_zip(dl_path, show_ui=show_status):
+                    _FFPROBE_CACHED, _FFMPEG_CACHED = fp, fm
+                    return _FFPROBE_CACHED, _FFMPEG_CACHED, "partial (download failed)" if partial_present else "not found"
+
+            _update("Распаковываю FFmpeg…")
+            if _extract_zip_to(base, dl_path):
+                fp3, fm3 = _find_bins_recursively(base)
+                if fp3 and fm3:
+                    _register_dir_for_dlls(str(Path(fp3).parent))
+                    _FFPROBE_CACHED, _FFMPEG_CACHED = fp3, fm3
+                    tag = "completed by download" if partial_present else "downloaded"
+                    _update("FFmpeg готов.")
+                    return _FFPROBE_CACHED, _FFMPEG_CACHED, tag
+            _update("Не удалось распаковать FFmpeg: архив повреждён или неполный.")
 
     _FFPROBE_CACHED, _FFMPEG_CACHED = fp, fm
     if partial_present:
@@ -728,12 +804,46 @@ st.set_page_config(
 st.title("🎧 Lecture Transcriptor → Markdown")
 
 # Диагностика FFmpeg + автодоустановка для частичных случаев
-fp_diag, fm_diag, src_diag = ensure_ffmpeg(autofix=True)
+fp_diag, fm_diag, src_diag = ensure_ffmpeg(autofix=True, show_status=True)
+
+if src_diag in {"zip extracted", "completed from zip", "downloaded", "completed by download"}:
+    if not st.session_state.get("_ffmpeg_post_install_rerun"):
+        st.session_state["_ffmpeg_post_install_rerun"] = True
+        st.rerun()
 
 with st.expander("🧰 FFmpeg (диагностика)", expanded=False):
     st.write(f"Источник: **{src_diag}**")
     st.write(f"ffprobe: `{fp_diag or 'не найден'}`")
     st.write(f"ffmpeg:  `{fm_diag or 'не найден'}`")
+    if not (fp_diag and fm_diag):
+        st.warning("FFmpeg установлен не полностью. Удалите `_ffmpeg` и `_ffmpeg.zip`, затем перезапустите приложение.")
+
+cuda_diag = diagnose_cuda_stack()
+with st.expander("⚙️ CUDA/cuDNN (диагностика)", expanded=False):
+    st.write(f"Windows: **{'да' if cuda_diag['os_windows'] else 'нет'}**")
+    st.write(f"nvidia-smi: **{'обнаружен' if cuda_diag['nvidia_smi_ok'] else 'не найден'}**")
+    st.write(f"CUDA_PATH*: **{', '.join(cuda_diag['cuda_path_vars']) if cuda_diag['cuda_path_vars'] else 'не заданы'}**")
+    st.write(f"CUDA bin-папки: **{len(cuda_diag['cuda_bin_dirs'])}**")
+    st.write(f"cuDNN bin-папки: **{len(cuda_diag['cudnn_bin_dirs'])}**")
+    if cuda_diag.get("nvidia_smi_preview"):
+        st.code(str(cuda_diag["nvidia_smi_preview"]), language="text")
+
+    if cuda_diag.get("ready_for_cuda"):
+        st.success("CUDA/cuDNN найдены. Можно использовать `GPU (CUDA)`.")
+    else:
+        st.warning("CUDA/cuDNN обнаружены не полностью. Приложение продолжит работать на CPU.")
+        st.markdown(
+            """
+1. Установите драйвер NVIDIA (после установки команда `nvidia-smi` должна работать в консоли).
+2. Установите CUDA Toolkit 12.x: https://developer.nvidia.com/cuda-downloads
+3. Установите cuDNN 9 под вашу версию CUDA: https://developer.nvidia.com/cudnn-downloads
+4. Если cuDNN скачан архивом, скопируйте файлы:
+   - `bin\\cudnn*.dll` -> `C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\vXX.X\\bin`
+   - `include\\cudnn*.h` -> `...\\include`
+   - `lib\\x64\\cudnn*.lib` -> `...\\lib\\x64`
+5. Перезапустите приложение после установки.
+            """
+        )
 
 # Если нашли ffmpeg/ffprobe — пропишем пути для pydub
 if fm_diag:
